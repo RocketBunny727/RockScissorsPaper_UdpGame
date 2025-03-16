@@ -29,7 +29,7 @@ void show_menu(const GameState& state) {
         else printw("  %s\n", options[i]);
     }
     if (state.waiting) {
-        printw("Waiting for the opponent's choise...\n");
+        printw("Waiting for the opponent's choice...\n");
     }
 }
 
@@ -44,36 +44,55 @@ bool show_end_menu(int& selection) {
 
 bool init_game(int client_socket, sockaddr_in& server_addr, socklen_t server_len, 
               std::string& nickname, GameState& state) {
-    sendto(client_socket, nickname.c_str(), nickname.length(), 0, 
-           (struct sockaddr*)&server_addr, server_len);
+    bool nick_accepted = false;
     
-    char buffer[1024];
-    int bytes = recvfrom(client_socket, buffer, sizeof(buffer) - 1, 0, 
-                        (struct sockaddr*)&server_addr, &server_len);
-    if (bytes <= 0) return false;
+    while (!nick_accepted) {
+        sendto(client_socket, nickname.c_str(), nickname.length(), 0, 
+               (struct sockaddr*)&server_addr, server_len);
+        
+        clear();
+        printw("\n\n\t\t\tWaiting for an opponent...\n");
+        refresh();
 
-    buffer[bytes] = '\0';
-    std::string message(buffer);
-    
-    if (message == "NICK_TAKEN") {
+        char buffer[1024];
+        int bytes = recvfrom(client_socket, buffer, sizeof(buffer) - 1, 0, 
+                           (struct sockaddr*)&server_addr, &server_len);
+        
+        if (bytes <= 0) {
+            endwin();
+            std::cerr << "Failed to connect to server" << std::endl;
+            return false;
+        }
+
+        buffer[bytes] = '\0';
+        std::string message(buffer);
+        
+        if (message == "NICK_TAKEN") {
+            endwin();
+            std::cout << "Nickname taken or invalid. Please choose another: ";
+            std::cin >> nickname;
+            initscr();
+            keypad(stdscr, TRUE);
+            noecho();
+            curs_set(0);
+            timeout(100);
+            continue;
+        }
+        
+        if (message.rfind("SESSION", 0) == 0) {
+            char opponent[256];
+            sscanf(buffer, "SESSION %s %d:%d", opponent, &state.myScore, &state.opScore);
+            state.opponentNick = opponent;
+            nick_accepted = true;
+            return true;
+        }
+        
         endwin();
-        std::cout << "Nickname taken or invalid. Please choose another: ";
-        std::cin >> nickname;
-        initscr();
-        keypad(stdscr, TRUE);
-        noecho();
-        curs_set(0);
-        timeout(100);
-        return init_game(client_socket, server_addr, server_len, nickname, state);
+        std::cerr << "Unexpected server response: " << message << std::endl;
+        return false;
     }
     
-    if (message.rfind("SESSION", 0) == 0) {
-        char opponent[256];
-        sscanf(buffer, "SESSION %s %d:%d", opponent, &state.myScore, &state.opScore);
-        state.opponentNick = opponent;
-        return true;
-    }
-    return false;
+    return true;
 }
 
 int main() {
@@ -110,7 +129,11 @@ int main() {
     timeout(100);
     
     GameState state;
-    init_game(client_socket, server_addr, server_len, nickname, state);
+    if (!init_game(client_socket, server_addr, server_len, nickname, state)) {
+        endwin();
+        close(client_socket);
+        return 1;
+    }
     
     char buffer[1024];
     while (true) {
@@ -165,10 +188,13 @@ int main() {
                 
                 if (show_end_menu(end_selection)) {
                     state = GameState();
-                    init_game(client_socket, server_addr, server_len, nickname, state);
+                    if (!init_game(client_socket, server_addr, server_len, nickname, state)) {
+                        endwin();
+                        close(client_socket);
+                        return 1;
+                    }
                 } else {
-                    sendto(client_socket, "EXIT", 4, 0, (struct sockaddr*)&server_addr, server_len);
-                    break;
+                    break; // Просто выходим, сервер уже удалил игрока при WIN/LOSE
                 }
             } else if (message.rfind("SCORE", 0) == 0) {
                 sscanf(buffer, "SCORE %d:%d", &state.myScore, &state.opScore);

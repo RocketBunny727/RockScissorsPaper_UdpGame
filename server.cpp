@@ -43,25 +43,6 @@ void send_to_player(const Player& player, const std::string& message) {
            (struct sockaddr*)&player.addr, player.addr_len);
 }
 
-void handle_exit(const Player& player) {
-    std::cout << "Player " << player.nickname << " from IP " 
-              << inet_ntoa(player.addr.sin_addr) << " disconnected" << std::endl;
-    players.erase(player.nickname);
-    
-    for (auto& session : sessions) {
-        if (session.active && 
-            (session.player1.nickname == player.nickname || 
-             session.player2.nickname == player.nickname)) {
-            session.active = false;
-            Player& opponent = (session.player1.nickname == player.nickname) 
-                             ? session.player2 : session.player1;
-            if (opponent.alive) {
-                send_to_player(opponent, "OPPONENT_LEFT");
-            }
-        }
-    }
-}
-
 void handle_new_connection(sockaddr_in client_addr, socklen_t client_len, const std::string& nick) {
     if (players.count(nick) > 0 || nick.empty()) {
         Player temp_player = {"", client_addr, client_len, "", time(nullptr), true};
@@ -115,10 +96,18 @@ void process_choice(Session& session) {
         send_to_player(session.player1, "WIN");
         send_to_player(session.player2, "LOSE");
         session.active = false;
+        std::cout << "Player " << session.player1.nickname << " won against " 
+                  << session.player2.nickname << std::endl;
+        std::cout << "Session ended: " << session.player1.nickname << " vs " 
+                  << session.player2.nickname << std::endl;
     } else if (session.score[1] >= 5) {
         send_to_player(session.player1, "LOSE");
         send_to_player(session.player2, "WIN");
         session.active = false;
+        std::cout << "Player " << session.player2.nickname << " won against " 
+                  << session.player1.nickname << std::endl;
+        std::cout << "Session ended: " << session.player1.nickname << " vs " 
+                  << session.player2.nickname << std::endl;
     } else {
         send_to_player(session.player1, score_msg1);
         send_to_player(session.player2, score_msg2);
@@ -133,7 +122,6 @@ void check_heartbeats() {
     for (auto& session : sessions) {
         if (!session.active) continue;
 
-        // Отправляем heartbeat-запрос каждые 5 секунд
         if (now - session.player1.last_heartbeat >= 5) {
             send_to_player(session.player1, "HEARTBEAT");
         }
@@ -141,13 +129,13 @@ void check_heartbeats() {
             send_to_player(session.player2, "HEARTBEAT");
         }
 
-        // Если ответа нет больше 10 секунд, считаем игрока отключенным
         if (now - session.player1.last_heartbeat > 10 && session.player1.alive) {
             session.player1.alive = false;
             if (session.player2.alive) {
                 send_to_player(session.player2, "OPPONENT_LEFT");
             }
             session.active = false;
+            std::cout << "Player " << session.player1.nickname << " disconnected due to timeout" << std::endl;
         }
         if (now - session.player2.last_heartbeat > 10 && session.player2.alive) {
             session.player2.alive = false;
@@ -155,6 +143,7 @@ void check_heartbeats() {
                 send_to_player(session.player1, "OPPONENT_LEFT");
             }
             session.active = false;
+            std::cout << "Player " << session.player2.nickname << " disconnected due to timeout" << std::endl;
         }
     }
 }
@@ -190,7 +179,7 @@ int main() {
         FD_SET(server_socket, &readfds);
         
         struct timeval tv;
-        tv.tv_sec = 1; // Проверяем каждую секунду
+        tv.tv_sec = 1;
         tv.tv_usec = 0;
 
         if (select(server_socket + 1, &readfds, NULL, NULL, &tv) >= 0) {
@@ -203,15 +192,7 @@ int main() {
                 
                 std::string message(buffer);
                 
-                if (message == "EXIT") {
-                    for (auto it = players.begin(); it != players.end(); ++it) {
-                        if (it->second.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
-                            it->second.addr.sin_port == client_addr.sin_port) {
-                            handle_exit(it->second);
-                            break;
-                        }
-                    }
-                } else if (message == "HEARTBEAT_RESPONSE") {
+                if (message == "HEARTBEAT_RESPONSE") {
                     for (auto& session : sessions) {
                         if (session.active) {
                             if (session.player1.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
@@ -241,7 +222,7 @@ int main() {
             }
         }
         
-        check_heartbeats(); // Проверяем подключение игроков
+        check_heartbeats();
         sessions.erase(std::remove_if(sessions.begin(), sessions.end(),
             [](const Session& s) { return !s.active; }), sessions.end());
     }

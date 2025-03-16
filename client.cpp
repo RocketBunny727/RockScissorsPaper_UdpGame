@@ -29,7 +29,7 @@ void show_menu(const GameState& state) {
         else printw("  %s\n", options[i]);
     }
     if (state.waiting) {
-        printw("Waiting for opponent...\n");
+        printw("Waiting for the opponent's choise...\n");
     }
 }
 
@@ -135,7 +135,10 @@ int main() {
             buffer[bytes] = '\0';
             std::string message(buffer);
             
-            if (message == "WIN" || message == "LOSE" || message == "OPPONENT_LEFT") {
+            if (message == "HEARTBEAT") {
+                sendto(client_socket, "HEARTBEAT_RESPONSE", 18, 0, 
+                       (struct sockaddr*)&server_addr, server_len);
+            } else if (message == "WIN" || message == "LOSE" || message == "OPPONENT_LEFT") {
                 clear();
                 printw("%s!\nPlay again?\n", 
                        (message == "WIN" ? "YOU WIN" : 
@@ -160,7 +163,7 @@ int main() {
                     }
                 }
                 
-                if (end_selection == 0) {
+                if (show_end_menu(end_selection)) {
                     state = GameState();
                     init_game(client_socket, server_addr, server_len, nickname, state);
                 } else {

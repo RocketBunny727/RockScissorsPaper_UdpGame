@@ -7,12 +7,15 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <unistd.h>
+#include <ctime>
 
 struct Player {
     std::string nickname;
     sockaddr_in addr;
     socklen_t addr_len;
     std::string choice;
+    time_t last_heartbeat;
+    bool alive;
 };
 
 struct Session {
@@ -24,6 +27,10 @@ struct Session {
     Session(Player p1, Player p2) : player1(p1), player2(p2), rounds(0), active(true) {
         score[0] = 0;
         score[1] = 0;
+        player1.last_heartbeat = time(nullptr);
+        player2.last_heartbeat = time(nullptr);
+        player1.alive = true;
+        player2.alive = true;
     }
 };
 
@@ -41,32 +48,34 @@ void handle_exit(const Player& player) {
               << inet_ntoa(player.addr.sin_addr) << " disconnected" << std::endl;
     players.erase(player.nickname);
     
-    for (std::vector<Session>::iterator it = sessions.begin(); it != sessions.end(); ++it) {
-        if (it->active && 
-            (it->player1.nickname == player.nickname || 
-             it->player2.nickname == player.nickname)) {
-            it->active = false;
-            Player& opponent = (it->player1.nickname == player.nickname) 
-                             ? it->player2 : it->player1;
-            send_to_player(opponent, "OPPONENT_LEFT");
+    for (auto& session : sessions) {
+        if (session.active && 
+            (session.player1.nickname == player.nickname || 
+             session.player2.nickname == player.nickname)) {
+            session.active = false;
+            Player& opponent = (session.player1.nickname == player.nickname) 
+                             ? session.player2 : session.player1;
+            if (opponent.alive) {
+                send_to_player(opponent, "OPPONENT_LEFT");
+            }
         }
     }
 }
 
 void handle_new_connection(sockaddr_in client_addr, socklen_t client_len, const std::string& nick) {
     if (players.count(nick) > 0 || nick.empty()) {
-        Player temp_player = {"", client_addr, client_len, ""};
+        Player temp_player = {"", client_addr, client_len, "", time(nullptr), true};
         send_to_player(temp_player, "NICK_TAKEN");
         return;
     }
     
-    Player new_player = {nick, client_addr, client_len, ""};
+    Player new_player = {nick, client_addr, client_len, "", time(nullptr), true};
     players[nick] = new_player;
     std::cout << "New player: " << nick << " connected from " 
               << inet_ntoa(client_addr.sin_addr) << std::endl;
     
     if (players.size() >= 2) {
-        std::unordered_map<std::string, Player>::iterator it = players.begin();
+        auto it = players.begin();
         Player p1 = it->second;
         players.erase(it);
         it = players.begin();
@@ -119,6 +128,37 @@ void process_choice(Session& session) {
     session.player2.choice.clear();
 }
 
+void check_heartbeats() {
+    time_t now = time(nullptr);
+    for (auto& session : sessions) {
+        if (!session.active) continue;
+
+        // Отправляем heartbeat-запрос каждые 5 секунд
+        if (now - session.player1.last_heartbeat >= 5) {
+            send_to_player(session.player1, "HEARTBEAT");
+        }
+        if (now - session.player2.last_heartbeat >= 5) {
+            send_to_player(session.player2, "HEARTBEAT");
+        }
+
+        // Если ответа нет больше 10 секунд, считаем игрока отключенным
+        if (now - session.player1.last_heartbeat > 10 && session.player1.alive) {
+            session.player1.alive = false;
+            if (session.player2.alive) {
+                send_to_player(session.player2, "OPPONENT_LEFT");
+            }
+            session.active = false;
+        }
+        if (now - session.player2.last_heartbeat > 10 && session.player2.alive) {
+            session.player2.alive = false;
+            if (session.player1.alive) {
+                send_to_player(session.player1, "OPPONENT_LEFT");
+            }
+            session.active = false;
+        }
+    }
+}
+
 int main() {
     server_socket = socket(AF_INET, SOCK_DGRAM, 0);
     if (server_socket < 0) {
@@ -130,7 +170,7 @@ int main() {
     int server_port = 12345;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(12345);
+    server_addr.sin_port = htons(server_port);
     server_addr.sin_addr.s_addr = INADDR_ANY;
     
     if (bind(server_socket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
@@ -149,7 +189,11 @@ int main() {
         FD_ZERO(&readfds);
         FD_SET(server_socket, &readfds);
         
-        if (select(server_socket + 1, &readfds, NULL, NULL, NULL) > 0) {
+        struct timeval tv;
+        tv.tv_sec = 1; // Проверяем каждую секунду
+        tv.tv_usec = 0;
+
+        if (select(server_socket + 1, &readfds, NULL, NULL, &tv) >= 0) {
             if (FD_ISSET(server_socket, &readfds)) {
                 memset(buffer, 0, sizeof(buffer));
                 client_len = sizeof(client_addr);
@@ -160,26 +204,36 @@ int main() {
                 std::string message(buffer);
                 
                 if (message == "EXIT") {
-                    for (std::unordered_map<std::string, Player>::iterator it = players.begin(); 
-                         it != players.end(); ++it) {
+                    for (auto it = players.begin(); it != players.end(); ++it) {
                         if (it->second.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
                             it->second.addr.sin_port == client_addr.sin_port) {
                             handle_exit(it->second);
                             break;
                         }
                     }
-                } else if (message == "ROCK" || message == "SCISSORS" || message == "PAPER") {
-                    for (std::vector<Session>::iterator it = sessions.begin(); 
-                         it != sessions.end(); ++it) {
-                        if (!it->active) continue;
-                        if (it->player1.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
-                            it->player1.addr.sin_port == client_addr.sin_port) {
-                            it->player1.choice = message;
-                        } else if (it->player2.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
-                                 it->player2.addr.sin_port == client_addr.sin_port) {
-                            it->player2.choice = message;
+                } else if (message == "HEARTBEAT_RESPONSE") {
+                    for (auto& session : sessions) {
+                        if (session.active) {
+                            if (session.player1.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
+                                session.player1.addr.sin_port == client_addr.sin_port) {
+                                session.player1.last_heartbeat = time(nullptr);
+                            } else if (session.player2.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
+                                     session.player2.addr.sin_port == client_addr.sin_port) {
+                                session.player2.last_heartbeat = time(nullptr);
+                            }
                         }
-                        process_choice(*it);
+                    }
+                } else if (message == "ROCK" || message == "SCISSORS" || message == "PAPER") {
+                    for (auto& session : sessions) {
+                        if (!session.active) continue;
+                        if (session.player1.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
+                            session.player1.addr.sin_port == client_addr.sin_port) {
+                            session.player1.choice = message;
+                        } else if (session.player2.addr.sin_addr.s_addr == client_addr.sin_addr.s_addr &&
+                                 session.player2.addr.sin_port == client_addr.sin_port) {
+                            session.player2.choice = message;
+                        }
+                        process_choice(session);
                     }
                 } else {
                     handle_new_connection(client_addr, client_len, message);
@@ -187,6 +241,7 @@ int main() {
             }
         }
         
+        check_heartbeats(); // Проверяем подключение игроков
         sessions.erase(std::remove_if(sessions.begin(), sessions.end(),
             [](const Session& s) { return !s.active; }), sessions.end());
     }

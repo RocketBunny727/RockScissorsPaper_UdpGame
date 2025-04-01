@@ -18,8 +18,14 @@ struct GameState {
     int opScore;
     int selection;
     bool waiting;
+    std::string opponent_ip;
+    int opponent_port;
+    std::vector<std::string> chat_messages;
+    bool in_chat;           // Флаг, показывающий, что пользователь в чате
+    std::string chat_input; // Текущий ввод сообщения в чате
 
-    GameState() : opponentNick("Unknown"), myScore(0), opScore(0), selection(0), waiting(false) {}
+    GameState() : opponentNick("Unknown"), myScore(0), opScore(0), selection(0), waiting(false), 
+                  opponent_port(0), in_chat(false) {}
 };
 
 bool is_valid_ip(const std::string& ip) {
@@ -42,7 +48,7 @@ bool is_valid_port(int port) {
 bool load_config(std::string& ip, int& port) {
     std::ifstream config(CONFIG_FILE);
     if (!config.is_open()) {
-        std::cerr << "Unable to open configurationfile: '" << CONFIG_FILE << "'" << std::endl;
+        std::cerr << "Unable to open configuration file: '" << CONFIG_FILE << "'" << std::endl;
         return false;
     }
 
@@ -84,11 +90,13 @@ bool load_config(std::string& ip, int& port) {
     return ip_found && port_found;
 }
 
-
 void show_game_info(const GameState& state) {
     std::string output = "Your opponent: " + state.opponentNick + "\nSCORE - " + 
                         std::to_string(state.myScore) + ":" + std::to_string(state.opScore);
     printw("%s\n", output.c_str());
+    if (!state.chat_messages.empty()) {
+        printw("Last chat message: %s\n", state.chat_messages.back().c_str());
+    }
 }
 
 void show_menu(const GameState& state) {
@@ -111,12 +119,23 @@ bool show_end_menu(int& selection) {
     return selection == 0;
 }
 
+void show_chat(GameState& state) { // Убрали chat_socket и nickname
+    printw("Chat with %s\n", state.opponentNick.c_str());
+    printw("----------------\n");
+
+    for (const auto& msg : state.chat_messages) {
+        printw("%s\n", msg.c_str());
+    }
+    printw("----------------\n");
+    printw("Type message (or press ESC to exit): %s", state.chat_input.c_str());
+}
+
 bool init_game(int client_socket, sockaddr_in& server_addr, socklen_t server_len, 
-              std::string& nickname, GameState& state) {
+              std::string& nick_with_port, GameState& state) {
     bool nick_accepted = false;
     
     while (!nick_accepted) {
-        sendto(client_socket, nickname.c_str(), nickname.length(), 0, 
+        sendto(client_socket, nick_with_port.c_str(), nick_with_port.length(), 0, 
                (struct sockaddr*)&server_addr, server_len);
         
         clear();
@@ -139,7 +158,7 @@ bool init_game(int client_socket, sockaddr_in& server_addr, socklen_t server_len
         if (message == "NICK_TAKEN") {
             endwin();
             std::cout << "Nickname taken or invalid. Please choose another: ";
-            std::cin >> nickname;
+            std::cin >> nick_with_port; // Здесь нужно будет переформировать nick_with_port вручную
             initscr();
             keypad(stdscr, TRUE);
             noecho();
@@ -149,9 +168,12 @@ bool init_game(int client_socket, sockaddr_in& server_addr, socklen_t server_len
         }
         
         if (message.rfind("SESSION", 0) == 0) {
-            char opponent[256];
-            sscanf(buffer, "SESSION %s %d:%d", opponent, &state.myScore, &state.opScore);
+            char opponent[256], ip[16];
+            int port;
+            sscanf(buffer, "SESSION %s %d:%d %s %d", opponent, &state.myScore, &state.opScore, ip, &port);
             state.opponentNick = opponent;
+            state.opponent_ip = ip;
+            state.opponent_port = port;
             nick_accepted = true;
             return true;
         }
@@ -192,6 +214,27 @@ int main() {
         return 1;
     }
 
+    int chat_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    if (chat_socket < 0) {
+        std::cerr << "Chat socket creation failed" << std::endl;
+        return 1;
+    }
+
+    sockaddr_in client_addr;
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sin_family = AF_INET;
+    client_addr.sin_addr.s_addr = INADDR_ANY;
+    client_addr.sin_port = 0;
+    if (bind(chat_socket, (struct sockaddr*)&client_addr, sizeof(client_addr)) < 0) {
+        std::cerr << "Chat socket bind failed" << std::endl;
+        return 1;
+    }
+
+    // Получаем порт, который был назначен системой
+    socklen_t client_len = sizeof(client_addr);
+    getsockname(chat_socket, (struct sockaddr*)&client_addr, &client_len);
+    int chat_port = ntohs(client_addr.sin_port);
+
     sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
@@ -224,6 +267,8 @@ int main() {
         break;
     }
 
+    std::string nick_with_port = nickname + ":" + std::to_string(chat_port);
+
     initscr();
     keypad(stdscr, TRUE);
     noecho();
@@ -231,23 +276,54 @@ int main() {
     timeout(100);
     
     GameState state;
-    if (!init_game(client_socket, server_addr, server_len, nickname, state)) {
+    if (!init_game(client_socket, server_addr, server_len, nick_with_port, state)) {
         endwin();
         close(client_socket);
+        close(chat_socket);
         return 1;
     }
     
     char buffer[1024];
     while (true) {
         clear();
-        show_game_info(state);
-        show_menu(state);
+        if (state.in_chat) {
+            show_chat(state);
+        } else {
+            show_game_info(state);
+            show_menu(state);
+        }
         refresh();
         
         int key = getch();
-        if (key == KEY_UP) state.selection = (state.selection + 2) % 3;
-        else if (key == KEY_DOWN) state.selection = (state.selection + 1) % 3;
-        else if (key == 10 && !state.waiting) {
+        if (key == 'C' || key == 'c') {
+            state.in_chat = !state.in_chat; // Переключаем режим чата
+            if (!state.in_chat) state.chat_input.clear(); // Очищаем ввод при выходе
+        } else if (state.in_chat) {
+            if (key == 27) { // ESC
+                state.in_chat = false;
+                state.chat_input.clear();
+            } else if (key == 10 && !state.chat_input.empty()) { // Enter
+                std::string message = nickname + ": " + state.chat_input;
+                state.chat_messages.push_back(message);
+
+                sockaddr_in opponent_addr;
+                memset(&opponent_addr, 0, sizeof(opponent_addr));
+                opponent_addr.sin_family = AF_INET;
+                opponent_addr.sin_port = htons(state.opponent_port);
+                inet_pton(AF_INET, state.opponent_ip.c_str(), &opponent_addr.sin_addr);
+                if (sendto(chat_socket, state.chat_input.c_str(), state.chat_input.length(), 0, 
+                           (struct sockaddr*)&opponent_addr, sizeof(opponent_addr)) < 0) {
+                    state.chat_messages.push_back("Failed to send message!");
+                }
+                state.chat_input.clear();
+            } else if (key >= 32 && key <= 126) { // Печатные символы
+                state.chat_input += static_cast<char>(key);
+            }
+        } else if (key == KEY_UP) {
+            state.selection = (state.selection + 2) % 3;
+        } else if (key == KEY_DOWN) {
+            state.selection = (state.selection + 1) % 3;
+        } else if (key == 10 && !state.waiting) {
             const char* choices[3] = {"ROCK", "SCISSORS", "PAPER"};
             sendto(client_socket, choices[state.selection], strlen(choices[state.selection]), 0, 
                    (struct sockaddr*)&server_addr, server_len);
@@ -290,22 +366,34 @@ int main() {
                 
                 if (show_end_menu(end_selection)) {
                     state = GameState();
-                    if (!init_game(client_socket, server_addr, server_len, nickname, state)) {
+                    if (!init_game(client_socket, server_addr, server_len, nick_with_port, state)) {
                         endwin();
                         close(client_socket);
+                        close(chat_socket);
                         return 1;
                     }
                 } else {
-                    break; // Просто выходим, сервер уже удалил игрока при WIN/LOSE
+                    break;
                 }
             } else if (message.rfind("SCORE", 0) == 0) {
                 sscanf(buffer, "SCORE %d:%d", &state.myScore, &state.opScore);
                 state.waiting = false;
             }
         }
+
+        sockaddr_in sender_addr;
+        socklen_t sender_len = sizeof(sender_addr);
+        bytes = recvfrom(chat_socket, buffer, sizeof(buffer) - 1, MSG_DONTWAIT, 
+                         (struct sockaddr*)&sender_addr, &sender_len);
+        if (bytes > 0) {
+            buffer[bytes] = '\0';
+            std::string chat_msg = state.opponentNick + ": " + std::string(buffer);
+            state.chat_messages.push_back(chat_msg);
+        }
     }
     
     endwin();
     close(client_socket);
+    close(chat_socket);
     return 0;
 }

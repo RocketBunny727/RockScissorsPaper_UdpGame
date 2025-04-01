@@ -16,6 +16,7 @@ struct Player {
     std::string choice;
     time_t last_heartbeat;
     bool alive;
+    int chat_port;
 };
 
 struct Session {
@@ -43,17 +44,26 @@ void send_to_player(const Player& player, const std::string& message) {
            (struct sockaddr*)&player.addr, player.addr_len);
 }
 
-void handle_new_connection(sockaddr_in client_addr, socklen_t client_len, const std::string& nick) {
-    if (players.count(nick) > 0 || nick.empty()) {
-        Player temp_player = {"", client_addr, client_len, "", time(nullptr), true};
+void handle_new_connection(sockaddr_in client_addr, socklen_t client_len, const std::string& message) {
+    char nick_buffer[256]; // Временный буфер для ника
+    int chat_port;
+    if (sscanf(message.c_str(), "%255[^:]:%d", nick_buffer, &chat_port) != 2) {
+        Player temp_player = {"", client_addr, client_len, "", time(nullptr), true, 0};
+        send_to_player(temp_player, "NICK_TAKEN");
+        return;
+    }
+
+    std::string nick = nick_buffer; // Преобразуем в std::string
+    if (nick.empty() || players.count(nick) > 0) {
+        Player temp_player = {"", client_addr, client_len, "", time(nullptr), true, 0};
         send_to_player(temp_player, "NICK_TAKEN");
         return;
     }
     
-    Player new_player = {nick, client_addr, client_len, "", time(nullptr), true};
+    Player new_player = {nick, client_addr, client_len, "", time(nullptr), true, chat_port};
     players[nick] = new_player;
     std::cout << "New player: " << nick << " connected from " 
-              << inet_ntoa(client_addr.sin_addr) << std::endl;
+              << inet_ntoa(client_addr.sin_addr) << " with chat port " << chat_port << std::endl;
     
     if (players.size() >= 2) {
         auto it = players.begin();
@@ -63,8 +73,16 @@ void handle_new_connection(sockaddr_in client_addr, socklen_t client_len, const 
         Player p2 = it->second;
         players.erase(it);
         sessions.push_back(Session(p1, p2));
-        send_to_player(p1, "SESSION " + p2.nickname + " 0:0");
-        send_to_player(p2, "SESSION " + p1.nickname + " 0:0");
+
+        std::string p1_info = "SESSION " + p2.nickname + " 0:0 " + 
+                             inet_ntoa(p2.addr.sin_addr) + " " + 
+                             std::to_string(p2.chat_port);
+        std::string p2_info = "SESSION " + p1.nickname + " 0:0 " + 
+                             inet_ntoa(p1.addr.sin_addr) + " " + 
+                             std::to_string(p1.chat_port);
+
+        send_to_player(p1, p1_info);
+        send_to_player(p2, p2_info);
     } 
 }
 
